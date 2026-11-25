@@ -39,6 +39,11 @@
 #' Setting `ve_floor` equal to `vaccine_effectiveness` gives a scenario with
 #' no waning (VE ramps up to its peak and then stays constant).
 #'
+#' `rng_seed` controls every random step (population, transmission, each
+#' vaccination round via rng_seed + round, and reporting). Use different
+#' seeds for replicate simulations; the default reproduces the surviver
+#' package datasets.
+#'
 #' @return A list with `demographic_data`, `vaccination_data`,
 #'   `incidence_data_reduced` (data frames), `params` (the phase-1 parameter
 #'   list, which records all scenario settings) and `study_end` (days).
@@ -53,12 +58,14 @@ simulate_waning_scenario <- function(ve_floor              = 0.1,
                                      n_chunks              = 16,
                                      chunk_days            = 10,
                                      chunk_coverage        = 0.03,
+                                     rng_seed              = 2026,
                                      output_dir            = tempfile("ibm_waning_"),
                                      verbose               = FALSE) {
 
   # ---- PHASE 1: INITIAL SPREAD (NO VACCINATION) ----
   params <- get_default_parameters()
 
+  params$rng_seed               <- rng_seed
   params$output_dir             <- output_dir
   params$pop_size               <- pop_size
   params$num_days               <- initial_days
