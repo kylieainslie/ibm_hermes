@@ -1,7 +1,7 @@
 ############################################################################ #
 # This file is part of the individual-based model framework called HERMES
 #
-# Goal: generate an example dataset for testing time-varying vaccine
+# Goal: generate example datasets for testing time-varying vaccine
 #       effectiveness (VE) estimation methods. Unlike the lockdown/exit
 #       scenario in ibm_interventions.R, this scenario:
 #         - uses a slowed-down epidemic (lower transmission_prob) so the
@@ -14,211 +14,167 @@
 #           compute_time_varying_ve() in ibm_core.R, so there is a genuine
 #           waning signal in the data for a VE(t) model to try to recover.
 #
-# Output is exported in the same three-file schema (demographic_data.rds,
-# vaccination_data.rds, incidence_data_reduced.rds) used by the group-D
-# VE-estimation vignette, so it can be dropped in as a drop-in replacement
-# for the existing example data.
+# Usage (from the root of the ibm_hermes repository):
+#
+#   source('lib/ibm_core.R')
+#   source('lib/ibm_waning_scenario.R')
+#   waning    <- simulate_waning_scenario(ve_floor = 0.1)
+#   no_waning <- simulate_waning_scenario(ve_floor = 0.8)  # flat VE after ramp
+#   export_waning_scenario(waning, "output/ibm_export_waning")
+#
+# Output tables follow the three-file schema (demographic_data,
+# vaccination_data, incidence_data_reduced) used by the surviver R package
+# and the group-D VE vignette in the Lorentz workshop repository.
+#
+# Requires ibm_core.R to have been sourced first.
 ############################################################################ #
 
-# ------------------------------------------------------------------------ -
-# DEPENDENCIES ----
-# ------------------------------------------------------------------------ -
+#' Simulate the waning-VE test scenario
+#'
+#' Phase 1: initial spread without vaccination for `initial_days` days.
+#' Phase 2: `n_chunks` calls to rerun_ibm(), each `chunk_days` long,
+#' vaccinating `chunk_coverage` of the remaining eligible pool per chunk with
+#' a distinct RNG seed (rng_seed + chunk index).
+#'
+#' Setting `ve_floor` equal to `vaccine_effectiveness` gives a scenario with
+#' no waning (VE ramps up to its peak and then stays constant).
+#'
+#' @return A list with `demographic_data`, `vaccination_data`,
+#'   `incidence_data_reduced` (data frames), `params` (the phase-1 parameter
+#'   list, which records all scenario settings) and `study_end` (days).
+simulate_waning_scenario <- function(ve_floor              = 0.1,
+                                     vaccine_effectiveness = 0.8,
+                                     ve_ramp_days          = 14,
+                                     ve_half_life          = 45,
+                                     pop_size              = 1e4,
+                                     transmission_prob     = 0.02,
+                                     num_infected_seeds    = 10,
+                                     initial_days          = 20,
+                                     n_chunks              = 16,
+                                     chunk_days            = 10,
+                                     chunk_coverage        = 0.03,
+                                     output_dir            = tempfile("ibm_waning_"),
+                                     verbose               = FALSE) {
 
-rm(list = ls())
+  # ---- PHASE 1: INITIAL SPREAD (NO VACCINATION) ----
+  params <- get_default_parameters()
 
-source('lib/ibm_core.R')
-library(ggplot2)
+  params$output_dir             <- output_dir
+  params$pop_size               <- pop_size
+  params$num_days               <- initial_days
+  params$num_infected_seeds     <- num_infected_seeds
+  params$bool_add_baseline      <- FALSE
+  params$bool_show_demographics <- FALSE
+  # NULL switches on the separate age-based natural mortality process
+  # (ibm_pop_death.R); disease deaths are identified by time_of_death
+  params$general_mortality_rate <- NULL
 
-# ------------------------------------------------------------------------ -
-# PHASE 1: INITIAL SPREAD (NO VACCINATION) ----
-# ------------------------------------------------------------------------ -
+  # Slowed epidemic relative to the default (0.1). A sweep at pop_size = 1e4
+  # found 0.035 peaks at day 41 and is extinct by day ~126 (before most of
+  # the campaign), while 0.02 peaks mid-campaign (day ~88) and is still
+  # transmitting at day 180, giving breakthrough events across the full
+  # range of days since vaccination.
+  params$transmission_prob      <- transmission_prob
 
-params <- get_default_parameters()
+  # vaccination is off during phase 1; VE settings apply once vaccinated
+  params$vaccine_coverage       <- 0
+  params$vaccine_effectiveness  <- vaccine_effectiveness
+  params$ve_ramp_days           <- ve_ramp_days
+  params$ve_half_life           <- ve_half_life
+  params$ve_floor               <- ve_floor
 
-params$output_dir             <- "output/ibm_waning"
-params$pop_size                <- 1e5
-params$num_days                 <- 20
-params$num_infected_seeds       <- 10
-params$bool_add_baseline        <- FALSE
-params$bool_show_demographics   <- FALSE
-params$general_mortality_rate   <- NULL
+  if (verbose) print_model_parameters(params)
 
-# slow the epidemic down relative to the default/legacy scenario (0.07-0.1)
-# so it stays sustained across the whole rolling vaccination campaign below,
-# rather than peaking and going extinct before most people are vaccinated.
-# A sweep at pop_size=1e4 found 0.035 peaks at day 41 and is extinct by day
-# ~126 (i.e. before, not during, most of the campaign; attack rate 71%),
-# while 0.02 peaks later (day ~88, mid-campaign) and sustains a 200-330
-# case plateau from ~day 55 through day 180 without going extinct (attack
-# rate ~32%) -- giving breakthrough events across the full range of
-# days-since-vaccination instead of concentrating them in the first ~45 days.
-params$transmission_prob        <- 0.02
+  run_ibm(params, verbose = verbose)
 
-# vaccination is off during the initial spread phase
-params$vaccine_coverage         <- 0
-params$vaccine_effectiveness    <- 0.8   # peak effectiveness once vaccinated
-params$ve_ramp_days             <- 14
-params$ve_half_life             <- 45
-params$ve_floor                 <- 0.1
+  pop_data         <- readRDS(file.path(params$output_dir, "pop_data.rds"))
+  health_time_data <- readRDS(file.path(params$output_dir, "health_time.rds"))
 
-print_model_parameters(params)
+  # ---- PHASE 2: ROLLING VACCINATION CAMPAIGN ----
+  for (i in seq_len(n_chunks)) {
 
-ibm_results <- run_ibm(params, verbose = FALSE)
+    chunk_params <- params
+    chunk_params$num_days           <- chunk_days
+    chunk_params$num_infected_seeds <- 0
+    chunk_params$vaccine_coverage   <- chunk_coverage
+    # independent random stream per chunk
+    chunk_params$rng_seed           <- params$rng_seed + i
 
-pop_data_file    <- file.path(ibm_results$params$output_dir, 'pop_data.rds')
-health_time_file <- file.path(ibm_results$params$output_dir, 'health_time.rds')
+    rerun_ibm(
+      pop_data               = pop_data,
+      prev_log_health_matrix = health_time_data$log_health,
+      params                 = chunk_params,
+      intervention           = i,
+      verbose                = verbose
+    )
 
-pop_data         <- readRDS(pop_data_file)
-health_time_data <- readRDS(health_time_file)
+    pop_data <- readRDS(file.path(
+      chunk_params$output_dir, paste0("pop_data_intervention", i, ".rds")))
+    health_time_data <- readRDS(file.path(
+      chunk_params$output_dir, paste0("health_time_intervention", i, ".rds")))
+  }
 
-# ------------------------------------------------------------------------ -
-# PHASE 2: ROLLING VACCINATION CAMPAIGN ----
-# ------------------------------------------------------------------------ -
+  study_end <- initial_days + n_chunks * chunk_days
 
-# roll out vaccination in many small increments (rather than 1-2 large
-# pulses) so vaccinated individuals are staggered across many calendar
-# days, giving the VE(t) model covariate variation to work with
-n_chunks        <- 16
-chunk_days      <- 10
-chunk_coverage  <- 0.03   # fraction of remaining eligible pool per chunk
-base_rng_seed   <- params$rng_seed
+  # ---- INCIDENCE DATA (WITH REPORTING DELAY) ----
+  delay_params            <- get_default_delay_parameters()
+  delay_params$output_dir <- params$output_dir
+  # get_default_delay_parameters() has no rng_seed, so obtain_incidence_data()
+  # would call set.seed(NULL) and draw different reporting delays/missingness
+  # on every run; seed it explicitly so the scenario is reproducible
+  delay_params$rng_seed   <- params$rng_seed
+  incidence_data          <- obtain_incidence_data(pop_data, delay_params)$incidence_data
 
-for (i in seq_len(n_chunks)) {
-
-  chunk_params <- params
-  chunk_params$num_days           <- chunk_days
-  chunk_params$num_infected_seeds <- 0
-  chunk_params$vaccine_coverage   <- chunk_coverage
-  # vary the seed per chunk so each rolling-campaign call draws an
-  # independent random stream rather than replaying the same one
-  chunk_params$rng_seed           <- base_rng_seed + i
-
-  rerun_results <- rerun_ibm(
-    pop_data                = pop_data,
-    prev_log_health_matrix  = health_time_data$log_health,
-    params                  = chunk_params,
-    intervention            = i,
-    verbose                 = FALSE
+  # ---- THREE-FILE VE ANALYSIS SCHEMA ----
+  demographic_data <- data.frame(
+    ind_id       = rownames(pop_data),
+    age          = pop_data$age,
+    sex          = pop_data$sex,
+    hh_id        = pop_data$hh_id,
+    classroom_id = pop_data$classroom_id,
+    workplace_id = pop_data$workplace_id,
+    time         = 0,
+    stringsAsFactors = FALSE
   )
 
-  pop_data_file    <- file.path(chunk_params$output_dir, paste0('pop_data_intervention', i, '.rds'))
-  health_time_file <- file.path(chunk_params$output_dir, paste0('health_time_intervention', i, '.rds'))
+  is_vaccinated <- !is.na(pop_data$time_of_vaccination)
+  vaccination_data <- data.frame(
+    ind_id              = rownames(pop_data)[is_vaccinated],
+    time_of_vaccination = pop_data$time_of_vaccination[is_vaccinated],
+    time                = study_end,
+    stringsAsFactors = FALSE
+  )
 
-  pop_data         <- readRDS(pop_data_file)
-  health_time_data <- readRDS(health_time_file)
+  incidence_data_reduced <- data.frame(
+    ind_id            = rownames(incidence_data),
+    time_of_reporting = incidence_data$time_of_reporting,
+    time              = study_end,
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    demographic_data       = demographic_data,
+    vaccination_data       = vaccination_data,
+    incidence_data_reduced = incidence_data_reduced,
+    params                 = params,
+    study_end              = study_end
+  )
 }
 
-study_end <- params$num_days + n_chunks * chunk_days
-
-# ------------------------------------------------------------------------ -
-# CREATE FINAL POPULATION DATA ----
-# ------------------------------------------------------------------------ -
-
-final_pop_data <- pop_data
-
-saveRDS(list(log_health = health_time_data$log_health, params = params),
-        file = file.path(params$output_dir, "final_health_time.rds"))
-saveRDS(final_pop_data,
-        file = file.path(params$output_dir, "final_pop_data.rds"))
-
-# ------------------------------------------------------------------------ -
-# DATASET: INCIDENCE DATA (WITH REPORTING DELAY) ----
-# ------------------------------------------------------------------------ -
-
-delay_params <- get_default_delay_parameters()
-delay_params$output_dir <- params$output_dir
-
-incidence_results   <- obtain_incidence_data(final_pop_data, delay_params)
-final_incidence_data <- incidence_results$incidence_data
-
-saveRDS(final_incidence_data,
-        file = file.path(delay_params$output_dir, "final_incidence_data.rds"))
-
-# ------------------------------------------------------------------------ -
-# EXPORT: DEMOGRAPHIC / VACCINATION / INCIDENCE FILES FOR VE ANALYSIS ----
-# ------------------------------------------------------------------------ -
-# schema matches analysis/group-D/data_wrangling.R in the workshop repo
-
-export_dir <- file.path(params$output_dir, "for_ve_analysis")
-if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
-
-demographic_data <- data.frame(
-  ind_id       = rownames(final_pop_data),
-  age          = final_pop_data$age,
-  sex          = final_pop_data$sex,
-  hh_id        = final_pop_data$hh_id,
-  classroom_id = final_pop_data$classroom_id,
-  workplace_id = final_pop_data$workplace_id,
-  time         = 0,
-  stringsAsFactors = FALSE
-)
-
-is_vaccinated <- !is.na(final_pop_data$time_of_vaccination)
-vaccination_data <- data.frame(
-  ind_id              = rownames(final_pop_data)[is_vaccinated],
-  time_of_vaccination = final_pop_data$time_of_vaccination[is_vaccinated],
-  time                = study_end,
-  stringsAsFactors = FALSE
-)
-
-incidence_data_reduced <- data.frame(
-  ind_id            = rownames(final_incidence_data),
-  time_of_reporting = final_incidence_data$time_of_reporting,
-  time              = study_end,
-  stringsAsFactors = FALSE
-)
-
-saveRDS(demographic_data,        file = file.path(export_dir, "demographic_data.rds"))
-saveRDS(vaccination_data,        file = file.path(export_dir, "vaccination_data.rds"))
-saveRDS(incidence_data_reduced,  file = file.path(export_dir, "incidence_data_reduced.rds"))
-
-cat("\nExported VE analysis input files to:", export_dir, "\n")
-cat("Study length (days):     ", study_end, "\n")
-cat("Population size:         ", nrow(demographic_data), "\n")
-cat("Vaccinated:              ", nrow(vaccination_data),
-    sprintf("(%.1f%%)", 100 * nrow(vaccination_data) / nrow(demographic_data)), "\n")
-cat("Reported cases:          ", nrow(incidence_data_reduced),
-    sprintf("(%.1f%%)", 100 * nrow(incidence_data_reduced) / nrow(demographic_data)), "\n")
-
-# ------------------------------------------------------------------------ -
-# DIAGNOSTICS ----
-# ------------------------------------------------------------------------ -
-
-fig_dir <- file.path(params$output_dir, "final_figures")
-if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
-
-# epidemic curve
-epi_curve_df <- data.frame(
-  day = seq_len(nrow(health_time_data$log_health)),
-  I   = health_time_data$log_health$I
-)
-
-p_epi <- ggplot(epi_curve_df, aes(x = day, y = I)) +
-  geom_line() +
-  labs(x = "Day", y = "Proportion infectious", title = "Epidemic curve (slowed scenario)")
-
-ggsave(file.path(fig_dir, "waning_scenario_epidemic_curve.png"), p_epi, width = 6, height = 4)
-
-# cumulative vaccination coverage over calendar time
-vacc_by_day <- data.frame(day = sort(unique(vaccination_data$time_of_vaccination)))
-vacc_by_day$cum_vaccinated <- sapply(vacc_by_day$day, function(d) {
-  sum(vaccination_data$time_of_vaccination <= d)
-})
-vacc_by_day$cum_coverage <- vacc_by_day$cum_vaccinated / nrow(demographic_data)
-
-p_vacc <- ggplot(vacc_by_day, aes(x = day, y = cum_coverage)) +
-  geom_step() +
-  labs(x = "Day", y = "Cumulative coverage", title = "Rolling vaccination campaign")
-
-ggsave(file.path(fig_dir, "waning_scenario_vaccination_coverage.png"), p_vacc, width = 6, height = 4)
-
-# events among vaccinated, by days since vaccination (checks whether there
-# is enough vaccinated-arm follow-up to identify waning out to ve_half_life)
-vax_merged <- merge(incidence_data_reduced, vaccination_data, by = "ind_id")
-vax_merged$days_since_vacc <- vax_merged$time_of_reporting - vax_merged$time_of_vaccination
-vax_merged <- vax_merged[vax_merged$days_since_vacc >= 0, ]
-
-cat("\nVaccinated-arm breakthrough events by days-since-vaccination bucket:\n")
-print(table(cut(vax_merged$days_since_vacc,
-                 breaks = c(0, 7, 14, 30, 45, 60, 90, Inf),
-                 right = FALSE)))
+#' Write a simulated scenario to disk in the three-file schema
+#'
+#' Writes demographic_data.rds, vaccination_data.rds,
+#' incidence_data_reduced.rds and scenario_params.rds (a list of `params`
+#' and `study_end`) to `export_dir`.
+export_waning_scenario <- function(scenario, export_dir) {
+  if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+  saveRDS(scenario$demographic_data,
+          file.path(export_dir, "demographic_data.rds"))
+  saveRDS(scenario$vaccination_data,
+          file.path(export_dir, "vaccination_data.rds"))
+  saveRDS(scenario$incidence_data_reduced,
+          file.path(export_dir, "incidence_data_reduced.rds"))
+  saveRDS(list(params = scenario$params, study_end = scenario$study_end),
+          file.path(export_dir, "scenario_params.rds"))
+  invisible(export_dir)
+}
