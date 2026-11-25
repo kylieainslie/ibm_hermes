@@ -71,6 +71,31 @@ is_susceptible <- function(health_vector, states) {
   health_vector %in% c(states$S, states$V)
 }
 
+#' Time-varying vaccine effectiveness
+#'
+#' Effectiveness rises linearly from 0 to a peak over \code{ve_ramp_days},
+#' then wanes exponentially toward \code{ve_floor} with the given half-life.
+#'
+#' @param days_since_vacc Numeric vector of days since vaccination.
+#' @param params Model parameter list (uses \code{vaccine_effectiveness} as
+#'   the peak, \code{ve_ramp_days}, \code{ve_half_life}, \code{ve_floor}).
+#' @return Numeric vector of effectiveness values, same length as input.
+compute_time_varying_ve <- function(days_since_vacc, params) {
+
+  ve <- numeric(length(days_since_vacc))
+
+  ramping <- days_since_vacc <= params$ve_ramp_days
+  ve[ramping] <- params$vaccine_effectiveness *
+    (days_since_vacc[ramping] / params$ve_ramp_days)
+
+  t_wane <- days_since_vacc[!ramping] - params$ve_ramp_days
+  decay_rate <- log(2) / params$ve_half_life
+  ve[!ramping] <- params$ve_floor +
+    (params$vaccine_effectiveness - params$ve_floor) * exp(-decay_rate * t_wane)
+
+  ve
+}
+
 # ------------------------------------------------------------------------ -
 # MAIN MODEL FUNCTION ----
 # ------------------------------------------------------------------------ -
@@ -203,9 +228,12 @@ run_ibm <- function(params, default_params = NULL, verbose = TRUE) {
           prob_infection[at_work] + transmission_probs$prob_workplace
       }
 
-      prob_infection[pop_data$health == states$V] <-
-        prob_infection[pop_data$health == states$V] *
-        (1 - params$vaccine_effectiveness)
+      is_vacc <- pop_data$health == states$V
+      if (any(is_vacc)) {
+        days_since_vacc <- day - pop_data$time_of_vaccination[is_vacc]
+        ve_t <- compute_time_varying_ve(days_since_vacc, params)
+        prob_infection[is_vacc] <- prob_infection[is_vacc] * (1 - ve_t)
+      }
 
       new_infections <- rbinom(
         params$pop_size, size = 1, prob = prob_infection
@@ -465,9 +493,12 @@ rerun_ibm <- function(pop_data, prev_log_health_matrix, params, intervention,
           prob_infection[at_work] + transmission_probs$prob_workplace
       }
       
-      prob_infection[pop_data$health == states$V] <-
-        prob_infection[pop_data$health == states$V] *
-        (1 - params$vaccine_effectiveness)
+      is_vacc <- pop_data$health == states$V
+      if (any(is_vacc)) {
+        days_since_vacc <- day - pop_data$time_of_vaccination[is_vacc]
+        ve_t <- compute_time_varying_ve(days_since_vacc, params)
+        prob_infection[is_vacc] <- prob_infection[is_vacc] * (1 - ve_t)
+      }
       
       new_infections <- rbinom(
         params$pop_size, size = 1, prob = prob_infection

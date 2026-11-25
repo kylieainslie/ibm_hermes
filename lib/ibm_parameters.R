@@ -29,7 +29,10 @@ get_default_parameters <- function() {
 
     # vaccination
     vaccine_coverage        = 0.2,
-    vaccine_effectiveness   = 0.8,
+    vaccine_effectiveness   = 0.8,   # peak effectiveness, reached after ve_ramp_days
+    ve_ramp_days            = 14,    # days to rise linearly from 0 to peak effectiveness
+    ve_half_life            = 45,    # days for effectiveness to halve after peak
+    ve_floor                = 0.1,   # long-run residual effectiveness after waning
     
     # incubation period
     shape_symptom_onset  = 10,
@@ -39,7 +42,18 @@ get_default_parameters <- function() {
     prop_symptoms = 0.8,
     
     # hospitalisation after symptom onset
-    prob_hospital                = 0.3,
+    # prob_hospital is a rate-scaling factor (like disease_mortality_rate),
+    # not a literal cumulative probability: the daily hazard
+    # prob_hospital * (1 - exp(-1/num_days_before_hospitalized)) competes
+    # against the daily recovery hazard (1 - exp(-1/num_days_infected)), so
+    # cumulative hospitalization risk depends on both in a way that isn't
+    # well approximated by the simple continuous competing-hazard ratio
+    # (a run at prob_hospital = 0.005 produced ~5.1% hospitalized-of-
+    # symptomatic, ~3.5x the ~1.5% that ratio predicts). 0.0015 is
+    # calibrated empirically (by direct simulation) to give a cumulative
+    # hospitalization risk of ~1.5% of symptomatic cases, in line with CDC
+    # seasonal influenza burden estimates (~1-2%).
+    prob_hospital                = 0.0015,
     num_days_before_hospitalized = 2,
     
     # disease natural history
@@ -71,7 +85,21 @@ get_default_parameters <- function() {
 
     # mortality (by age)
     general_mortality_rate = c(rep(0, 60), seq(0, 0.01, length = 30)),
-    disease_mortality_rate = c(rep(0.01, 60), seq(0.01, 0.7, length = 30)),
+    # disease_mortality_rate is a per-day hazard (applied via 1 - exp(-rate))
+    # while infected, competing against the daily recovery hazard
+    # (1 - exp(-1/num_days_infected)). Values below target a disease-caused
+    # infection-fatality risk of ~0.02% for ages 1-60 rising to ~2% at the
+    # oldest ages, consistent with published age-specific influenza
+    # case-fatality/IFR estimates (McDonald et al. 2023); verified by direct
+    # simulation (pop_size=1e4) at 0.06% (ages 1-60, n=3 deaths) and 0.54%
+    # (ages 61-90, n=7 deaths) disease-caused IFR — noisy on few events but
+    # consistent with target. NOTE: this is the disease-specific hazard
+    # only. If general_mortality_rate is set to NULL (as in
+    # ibm_waning_scenario.R), a separate age-based natural-mortality process
+    # also runs and is not distinguished from disease deaths in the
+    # `health == "D"` state — use `time_of_death` (disease) vs
+    # `time_of_natural_death` (background) to separate the two.
+    disease_mortality_rate = c(rep(0.00003, 60), seq(0.0003, 0.003, length = 30)),
 
     # visualisation and output
     bool_show_demographics = TRUE,

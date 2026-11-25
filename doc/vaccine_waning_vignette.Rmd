@@ -1,0 +1,235 @@
+---
+title: "Vignette: Time-Varying Vaccine Effectiveness Scenario"
+subtitle: "A waning-immunity extension to HERMES for VE(t) estimation exercises"
+date: "September 10, 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: false
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+This vignette documents the waning vaccine-effectiveness (VE) scenario implemented in
+`lib/ibm_waning_scenario.R`, built on top of the `compute_time_varying_ve()` extension to
+the HERMES core (`lib/ibm_core.R`). It is intended as example data for VE(t) estimation
+exercises, so unlike the simpler lockdown/exit scenarios distributed with HERMES, it is
+designed specifically to leave a genuine, recoverable waning signal in the simulated data:
+
+- the epidemic is slowed down (lower `transmission_prob`) so it burns over a long enough
+  window for vaccination to reach a meaningful share of the population before it dies out;
+- vaccination is rolled out in many small increments rather than one or two large pulses,
+  so vaccinated individuals are staggered across many calendar days of `time_of_vaccination`;
+  and
+- vaccine effectiveness itself varies with time since vaccination (a ramp-up followed by
+  exponential waning to a floor), rather than the constant effectiveness used elsewhere
+  in the framework.
+
+See `doc/user_manual_HERMES.Rmd` for the full model description (population structure,
+transmission dynamics, natural history). This vignette covers only what is specific to the
+waning-VE extension.
+
+# Time-varying vaccine effectiveness model
+
+`compute_time_varying_ve()` (`lib/ibm_core.R`) replaces the constant multiplier
+`(1 - vaccine_effectiveness)` applied to a vaccinated individual's infection probability
+with a function of `days_since_vacc = day - time_of_vaccination`:
+
+$$
+VE(t) =
+\begin{cases}
+VE_{\text{peak}} \cdot \dfrac{t}{t_{\text{ramp}}}, & t \le t_{\text{ramp}} \\[6pt]
+VE_{\text{floor}} + (VE_{\text{peak}} - VE_{\text{floor}}) \cdot \exp\left(-\dfrac{\ln 2}{t_{1/2}}\,(t - t_{\text{ramp}})\right), & t > t_{\text{ramp}}
+\end{cases}
+$$
+
+Effectiveness rises linearly from 0 to a peak (`vaccine_effectiveness`) over `ve_ramp_days`,
+then decays exponentially with half-life `ve_half_life` toward a residual floor `ve_floor`.
+`time_of_vaccination` is stamped in simulation-day units at the point of vaccination — day 0
+for the initial cohort vaccinated in `run_ibm()`, or `nprev_days` (the day count carried over
+from the prior run) for cohorts vaccinated in `rerun_ibm()` — so `days_since_vacc` is always
+$\ge 1$ the first time it is used, consistent with how `time_of_infection` is handled for
+seeded cases.
+
+## Parameter values and literature support
+
+| Parameter | Default value | Literature support | Reference |
+|---|---|---|---|
+| `vaccine_effectiveness` (peak) | 0.8 | On the high end of measured seasonal influenza VE (typically 40-60% against confirmed illness, occasionally higher against well-matched strains in younger adults); reasonable as an upper-bound/optimistic scenario rather than a typical-season estimate. | Ferdinands et al. 2018 |
+| `ve_ramp_days` | **14** (updated from 7) | Matches the ~2-week interval commonly used as the start of the "fully vaccinated" reference window in VE studies; consistent with CDC guidance that protective antibody levels take about two weeks to develop, and with Ferdinands et al.'s use of day 15 as the start of the peak-VE comparison window. | Ferdinands et al. 2018; CDC |
+| `ve_half_life` | 45 days | Fitting an exponential decay to Ferdinands et al.'s A(H3N2) estimates (45% VE at day 15-90 midpoint ≈ day 52; 13% VE at day 91-180 midpoint ≈ day 135) implies a half-life of ≈46 days, closely matching the default. Broadly consistent with Chung et al.'s finding of a 9% absolute VE decline every 28 days from day 41 onward. | Ferdinands et al. 2018; Chung et al. 2024 |
+| `ve_floor` | 0.1 | Not directly estimable from the literature — studies generally lack power beyond ~180 days post-vaccination, so this is a modelling assumption rather than a calibrated value. | Ferdinands et al. 2018 (explicitly notes insufficient data beyond 180 days) |
+
+**Caveats carried over from the underlying evidence:** waning appears to be age- and
+strain-dependent (stronger for A(H3N2), and not detected in children in the Ontario
+data), whereas the current implementation applies one fixed ramp/half-life/floor to
+every vaccinated individual regardless of age or strain.
+
+# Scenario design (`lib/ibm_waning_scenario.R`)
+
+## Phase 1 — initial spread, no vaccination
+
+A large population (`pop_size = 1e5`) is seeded with 10 infections and run for 20 days with
+`vaccine_coverage = 0` and a reduced `transmission_prob = 0.02` (vs. the framework default of
+0.1), chosen so the epidemic stays sustained across the *entire* 180-day study rather than
+peaking and dying out before most people are vaccinated (see Verification below).
+
+## Phase 2 — rolling vaccination campaign
+
+`rerun_ibm()` is called 16 times in 10-day chunks, vaccinating 3% of the remaining eligible
+pool each time (a distinct RNG seed per chunk). This staggers `time_of_vaccination` across
+many calendar days instead of one or two pulses, giving a VE(t) estimator covariate
+variation to work with. Total study length is `num_days + n_chunks * chunk_days` = 20 + 160
+= 180 days.
+
+## Outputs
+
+- `output/ibm_waning/final_pop_data.rds`, `final_health_time.rds` — full simulation state.
+- `output/ibm_waning/for_ve_analysis/{demographic_data,vaccination_data,incidence_data_reduced}.rds`
+  — matches the three-file schema used by the group-D VE-estimation vignette, so it is a
+  drop-in replacement for the existing example data.
+- `output/ibm_waning/final_figures/` — epidemic curve, cumulative vaccination coverage, and
+  a breakthrough-events-by-days-since-vaccination table (a quick check that there is enough
+  vaccinated-arm follow-up time to identify waning out to `ve_half_life`).
+
+```{r, eval=FALSE}
+source("lib/ibm_core.R")
+source("lib/ibm_waning_scenario.R")
+```
+
+## Verification by direct simulation
+
+The scenario design was checked by actually running it (a `pop_size = 1e4` version, identical
+rates and chunk timing to the full `pop_size = 1e5` scenario, for tractable runtime).
+
+**Epidemic timing / choice of `transmission_prob`.** An earlier draft of this scenario used
+`transmission_prob = 0.035`. Direct simulation showed that peaks at day 41 and is extinct by
+day ~126 (71% final attack rate) — i.e. the epidemic is largely over *before* the 160-day,
+16-chunk vaccination rollout (days 21-180) has progressed far: at the peak (day 40-41) only
+~6% of the population is vaccinated, and cumulative coverage doesn't climb into double
+digits until well after transmission has already crested. This front-loads breakthrough
+events into the first ~45 days since vaccination and starves the 45+/60+/90+ day-since-
+vaccination strata of events, since by the time early vaccinees accrue that much follow-up
+time the epidemic has already died out.
+
+A sweep of `transmission_prob` values (`pop_size = 1e4`, 180 days, no vaccination) found:
+
+| `transmission_prob` | Peak I | Peak day | Extinct by | Final attack rate |
+|---|---|---|---|---|
+| 0.035 | 1,603 | 41 | day 126 | 71.1% |
+| **0.02** | 335 | 88 | not by day 180 | 32.4% |
+| 0.015 | 46 | 63 | not by day 180 | 5.0% |
+| 0.012 | 15 | 4 | day 73 | 0.3% |
+| 0.01 | 14 | 6 | day 102 | 0.6% |
+
+`0.02` gives the best behaviour for this scenario's purpose: incidence sustains a plateau of
+roughly 200-330 concurrently infectious individuals from ~day 55 through day 180 (not
+extinct even by the end of the study), with the peak falling mid-campaign (day 88) rather
+than near its start, and a substantial (32.4%) final attack rate. `0.015` sustains longer but
+at too low an attack rate to generate enough absolute events; `0.012` and `0.01` fizzle out
+early with negligible attack rates. **The scenario now uses `transmission_prob = 0.02`.**
+
+- **Breakthrough follow-up.** Re-running the full scenario (`pop_size = 1e4`, all other
+  settings unchanged) under `transmission_prob = 0.02` confirms the fix: peak I=178 on day 79
+  (mid-campaign), still 13-14 infectious at day 180 (not extinct), 38.4% vaccinated and 22.5%
+  ever-infected by day 180. Vaccinated-arm breakthrough events by days-since-vaccination are
+  now **28 (0-7d), 19 (7-14d), 25 (14-30d), 18 (30-45d), 19 (45-60d), 40 (60-90d), 44 (90+d)**
+  — a complete reversal from the old `transmission_prob = 0.035` result (79/63/60/38/12/9/2):
+  the 60+ day tail is now the *best*-represented part of the distribution rather than the
+  thinnest, which is exactly what's needed to identify decay out to and beyond
+  `ve_half_life = 45`. Total breakthrough events are lower overall (193 vs. 263, since the
+  ever-infected fraction is smaller at 22.5% vs. 48.3%), but the full `pop_size = 1e5`
+  scenario should scale all of these counts up roughly 10-fold.
+- **Hospitalization/mortality sanity check (same re-run).** 15/1,746 symptomatic cases
+  hospitalized (0.86%), consistent with the recalibrated `prob_hospital = 0.0015` targeting
+  ~1-2%. This is what originally surfaced the `prob_hospital` recalibration below, and an
+  important confound in how "mortality" should be read from this scenario's output — see the
+  next section.
+
+# Consistency check: other disease/transmission parameters vs. influenza literature
+
+The waning-VE extension only touches vaccination-related parameters. The table below
+checks the framework's other disease natural-history and transmission parameters
+(`get_default_parameters()`, `lib/ibm_parameters.R`) against published estimates for
+seasonal influenza, since these jointly determine the epidemic against which VE is
+estimated.
+
+| Parameter | Model value | Implied quantity | Literature range | Assessment | Reference |
+|---|---|---|---|---|---|
+| `shape_symptom_onset`, `scale_symptom_onset` | 10, 0.5 | Mean incubation ≈ 5 days (discrete gamma, sd ≈ 1.6) | Median ≈1.4 days (influenza A), ~1-4 days range | **Inconsistent** — model incubation is roughly 2.5-3× longer than reported estimates | Lessler et al. 2009 |
+| `num_days_infected` | 7 days | Mean infectious/sojourn period | Viral shedding typically ~4-8 days | Consistent, upper end of range | WHO seasonal influenza fact sheet |
+| `prop_symptoms` | 0.8 | 80% of infections symptomatic | ~66-80% commonly used/estimated | Consistent | Longini et al.; WHO |
+| `contact_prob_household` × `transmission_prob` | 0.9 × 0.1 (default) / 0.9 × 0.02 (waning scenario) | Implied cumulative household secondary attack rate over a 7-day infectious period: ≈48% (default) / ≈12% (waning scenario, at `transmission_prob = 0.02`) | Household secondary attack rates ~1-38% across studies, commonly cited in the 10-20% range | **Default is inconsistent** (too high); the waning scenario's slowed-down `transmission_prob = 0.02` lands within the literature range | Tsang et al. 2016 |
+| `prob_hospital` | **0.0015** (updated from 0.3, via 0.005) | `prob_hospital` scales a daily hazard that competes against the daily recovery hazard, so it is not itself a cumulative probability. Direct simulation (n=10,000) at `prob_hospital = 0.005` gave 5.10% hospitalized-of-symptomatic — ~3.5x higher than the ~1.5% a simple continuous competing-hazard-ratio approximation predicts. 0.0015 was calibrated by scaling this empirical result (the mapping is close to linear here, since the hazards involved are all small relative to the recovery hazard) | Roughly 1-2% of symptomatic influenza illnesses are hospitalized in surveillance-based burden estimates | Consistent (empirically recalibrated) | CDC seasonal flu burden estimates |
+| `disease_mortality_rate` | 0.00003 (ages 1-60) rising to 0.003 (oldest ages) — unchanged from the first update | Disease-caused infection-fatality risk (from `time_of_death`, isolated from background natural deaths — see note below): 0.057% (ages 1-60, 3/5,289 infected) and 0.536% (ages 61-90, 7/1,306 infected) in a direct simulation. Noisy given so few events, but in the right range without further adjustment | Population-level influenza IFR is of order 0.01-1%; age-specific case-fatality estimates for the oldest ages reach a few percent | Consistent (verified, no change needed) | McDonald et al. 2023 |
+
+**Net assessment:** the contact-network structure (community/household/school/workplace
+mixing), the recovery/symptomatic-fraction parameters, and (as of this update)
+`prob_hospital` and `disease_mortality_rate` are now broadly consistent with published
+influenza estimates, and the `ve_half_life` default is unexpectedly well calibrated
+against real VE-waning data. `shape_symptom_onset`/`scale_symptom_onset` remain
+inconsistent (incubation period ~2.5-3x longer than reported estimates) — this was not
+changed here since it falls outside the scope of the vaccine-waning extension, but should
+be revisited before using default HERMES output as a quantitatively realistic influenza
+scenario (as opposed to a stylized/pedagogical one).
+
+**Important confound when reading mortality out of this scenario's output:** the initial
+recalibration pass computed a pooled `health == "D"` fatality rate of 78/6,637 = 1.18% of
+ever-infected individuals, which looked ~2-4x too high relative to target even after
+adjusting `disease_mortality_rate`. Direct inspection showed only 10 of those 78 deaths were
+disease-caused (`time_of_death` set); the other 68 were background natural deaths
+(`time_of_natural_death` set), because `ibm_waning_scenario.R` sets
+`general_mortality_rate <- NULL`, which switches on a separate age-based
+life-table natural-mortality process (`ibm_pop_death.R`) that is *not* distinguished from
+disease deaths in the pooled `health == "D"` state. Over a 180-day window with a
+substantial elderly sub-population, natural deaths dominate the pooled count. Any analysis
+of disease-specific mortality in this scenario's output must use `time_of_death`
+specifically, not `health == "D"` or `time_of_natural_death`. This is a pre-existing
+characteristic of the framework (not introduced by the waning-VE extension) worth noting
+for anyone using `for_ve_analysis` outputs downstream.
+
+Note on the hospitalization recalibration method: because the daily hospitalization hazard
+competes against the daily recovery hazard (`1 - exp(-1/num_days_infected)`), a first-pass
+continuous competing-hazard-ratio approximation ($\rho / (\rho + h_R - \rho h_R)$ for a rate
+$\rho$ against recovery hazard $h_R$) underestimated the true simulated cumulative
+hospitalization risk by roughly 3.5x — plausibly because the discrete-time,
+symptom-onset-then-recovery eligibility window in the actual code isn't fully captured by
+that simplified formula. Rather than keep refining the analytical approximation, the final
+`prob_hospital` value was calibrated empirically: one real simulated data point
+(`prob_hospital = 0.005` → 5.10%) was used to linearly rescale to the target (~1.5%), which
+is justified because all candidate hazard values here are small relative to the recovery
+hazard, keeping the response close to linear.
+
+# References
+
+- Ferdinands JM, Fry AM, Reynolds S, et al. Duration of Influenza Vaccine Effectiveness:
+  A Systematic Review, Meta-analysis, and Meta-regression of Test-Negative Design
+  Case-Control Studies. *J Infect Dis*. 2018;217(5):731-741.
+  <https://academic.oup.com/jid/article/217/5/731/4694421>
+- Chung H, Campitelli MA, Buchan SA, et al. Measuring waning protection from seasonal
+  influenza vaccination during nine influenza seasons, Ontario, Canada, 2010/11 to 2018/19.
+  *Euro Surveill*. 2024;29(8):2300239.
+  <https://pmc.ncbi.nlm.nih.gov/articles/PMC10899815/>
+- Lessler J, Reich NG, Brookmeyer R, Perl TM, Nelson KE, Cummings DAT. Incubation periods
+  of acute respiratory viral infections: a systematic review. *Lancet Infect Dis*.
+  2009;9(5):291-300.
+- Tsang TK, Lau LLH, Cauchemez S, Cowling BJ. Household Transmission of Influenza Virus.
+  *Trends Microbiol*. 2016;24(2):123-133.
+- McDonald SA, Teirlinck AC, Hooiveld M, van Asten L, Meijer A, de Lange M,
+  van Gageldonk-Lafeber AB, Wallinga J. Inference of age-dependent case-fatality ratios
+  for seasonal influenza virus subtypes A(H3N2) and A(H1N1)pdm09 and B lineages using data
+  from the Netherlands. *Influenza Other Respir Viruses*. 2023;17(6):e13146.
+  <https://pmc.ncbi.nlm.nih.gov/articles/PMC10279999/>
+- CDC. Human Serology & Flu; Disease Burden of Flu.
+  <https://www.cdc.gov/flu/php/viruses/human-serology.html>
+- WHO. Influenza (Seasonal) fact sheet.
+  <https://www.who.int/news-room/fact-sheets/detail/influenza-(seasonal)>
